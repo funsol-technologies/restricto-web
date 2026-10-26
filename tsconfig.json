@@ -13,7 +13,9 @@
     "skipLibCheck": true,
     "isolatedModules": true,
     "esModuleInterop": true,
-    "types": ["node"]
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": { "@funsol/restricto-web": ["./src/index.ts"] }
   },
   "include": ["src", "tests", "tsup.config.ts", "vitest.config.ts"]
 }

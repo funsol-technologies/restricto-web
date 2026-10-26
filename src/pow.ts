@@ -129,16 +129,32 @@ function solveInWorker(worker: WorkerLike, prefix: string, bits: number, o: PowO
   });
 }
 
-const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+/** MessageChannel instead of setTimeout: timers in background tabs are throttled to ~1 s, messages are not. */
+function tick(): Promise<void> {
+  if (typeof MessageChannel === 'undefined') return new Promise((r) => setTimeout(r, 0));
+  return new Promise((resolve) => {
+    const ch = new MessageChannel();
+    ch.port1.onmessage = () => {
+      ch.port1.close();
+      resolve();
+    };
+    ch.port2.postMessage(0);
+  });
+}
 
 async function solveOnMainThread(prefix: string, bits: number, o: PowOptions): Promise<string> {
   const search = makeSearcher();
   const bytes = new TextEncoder().encode(prefix);
-  for (let from = 0; ; from += CHUNK) {
-    if (o.signal?.aborted) throw abortError();
-    const hit = search(bytes, bits, from, CHUNK);
-    if (hit >= 0) return String(hit);
-    o.onProgress?.(from + CHUNK);
+  let from = 0;
+  for (;;) {
+    const sliceEnd = Date.now() + 40; // keep the page responsive: ~40 ms of hashing per slice
+    do {
+      if (o.signal?.aborted) throw abortError();
+      const hit = search(bytes, bits, from, CHUNK);
+      if (hit >= 0) return String(hit);
+      from += CHUNK;
+    } while (Date.now() < sliceEnd);
+    o.onProgress?.(from);
     await tick();
   }
 }

@@ -48,7 +48,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "rm -rf dist && tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "size": "node scripts/size.mjs"
