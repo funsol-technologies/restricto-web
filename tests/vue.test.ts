@@ -33,6 +33,8 @@ const Probe = defineComponent({
       h('span', { class: 'status' }, this.r.status.value),
       h('span', { class: 'device' }, this.r.deviceId.value ?? '-'),
       h('span', { class: 'err' }, this.r.error.value?.code ?? ''),
+      h('span', { class: 'cfg' }, this.r.config.value.source),
+      h('span', { class: 'up' }, this.r.upgrade.value ? `${this.r.upgrade.value.mode}:${this.r.upgrade.value.reason}` : '-'),
     ]);
   },
 });
@@ -97,5 +99,19 @@ describe('Vue plugin', () => {
 
   it('useRestricto() without the plugin throws a helpful error', () => {
     expect(() => mount(Probe)).toThrow(/createRestrictoPlugin/);
+  });
+});
+
+describe('config + upgrade in the Vue composable', () => {
+  it('exposes the signed config status and a hard upgrade requirement reactively', async () => {
+    const { server, config } = setup();
+    server.publishConfig({ extra: { min_sdk: { web: '9.0.0' } } });
+    const wrapper = mount(Probe, { global: { plugins: [createRestrictoPlugin({ ...config, pinnedResponseKeys: undefined, pinnedConfigKeys: server.pinnedConfigKeys })] } });
+    expect(wrapper.find('.cfg').text()).toBe('defaults');
+    const client = wrapper.vm.$.appContext.config.globalProperties.$restricto;
+    await expect(client.fetch(`${BASE}/api/x/`)).rejects.toMatchObject({ code: 'upgrade_required' });
+    await flushPromises();
+    expect(wrapper.find('.cfg').text()).toBe('valid');
+    expect(wrapper.find('.up').text()).toBe('hard:min_sdk');
   });
 });

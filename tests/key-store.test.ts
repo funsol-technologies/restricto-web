@@ -48,6 +48,21 @@ describe('IndexedDB key store', () => {
     }
   });
 
+  it('persists the config document next to (but separately from) the device record', async () => {
+    const store = createIndexedDbKeyStore('t3');
+    const cfg = { doc: { payload: 'p', kid: 'k', sig: 's' }, seq: 9 };
+    await store.putConfig!('app', cfg);
+    expect(await createIndexedDbKeyStore('t3').getConfig!('app')).toEqual(cfg);
+    expect(await store.get('app')).toBeUndefined();
+    const pair = await newKey();
+    await store.put('app', { privateKey: pair.privateKey, publicKey: 'p' });
+    await store.delete('app'); // reset() keeps the anti-rollback floor
+    expect((await store.getConfig!('app'))!.seq).toBe(9);
+    const d = defaultKeyStore();
+    await d.putConfig!('z', cfg);
+    expect(await d.getConfig!('z')).toEqual(cfg);
+  });
+
   it('memory store basics', async () => {
     const s = createMemoryKeyStore();
     const pair = await newKey();

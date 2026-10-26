@@ -1,4 +1,5 @@
-import { abortError } from './errors';
+import { POW_SDK_MAX_BITS } from './config-defaults';
+import { abortError, RestrictoError } from './errors';
 
 /**
  * Self-contained on purpose: `makeSearcher.toString()` is the source of the inline worker, so it must not reference
@@ -90,6 +91,8 @@ export interface WorkerLike {
 
 export interface PowOptions {
   signal?: AbortSignal;
+  /** Wall-clock budget in ms for the whole solve; the work is abandoned afterwards. Default 60 s. */
+  budgetMs?: number;
   onProgress?: (attempts: number) => void;
   /** false forces the main thread (used by tests and strict-CSP pages). */
   useWorker?: boolean;
@@ -109,9 +112,13 @@ function defaultWorker(source: string): WorkerLike | undefined {
   }
 }
 
-function solveInWorker(worker: WorkerLike, prefix: string, bits: number, o: PowOptions): Promise<string> {
+const budgetError = (): RestrictoError => new RestrictoError('register_failed', 'Proof of work exceeded its time budget; giving up.');
+
+function solveInWorker(worker: WorkerLike, prefix: string, bits: number, o: PowOptions, deadline: number): Promise<string> {
   return new Promise((resolve, reject) => {
+    const budget = setTimeout(() => done(() => reject(budgetError())), Math.max(0, deadline - Date.now()));
     const done = (fn: () => void): void => {
+      clearTimeout(budget);
       o.signal?.removeEventListener('abort', onAbort);
       worker.terminate();
       fn();
@@ -142,7 +149,7 @@ function tick(): Promise<void> {
   });
 }
 
-async function solveOnMainThread(prefix: string, bits: number, o: PowOptions): Promise<string> {
+async function solveOnMainThread(prefix: string, bits: number, o: PowOptions, deadline: number): Promise<string> {
   const search = makeSearcher();
   const bytes = new TextEncoder().encode(prefix);
   let from = 0;
@@ -150,6 +157,7 @@ async function solveOnMainThread(prefix: string, bits: number, o: PowOptions): P
     const sliceEnd = Date.now() + 40; // keep the page responsive: ~40 ms of hashing per slice
     do {
       if (o.signal?.aborted) throw abortError();
+      if (Date.now() > deadline) throw budgetError();
       const hit = search(bytes, bits, from, CHUNK);
       if (hit >= 0) return String(hit);
       from += CHUNK;
@@ -160,14 +168,17 @@ async function solveOnMainThread(prefix: string, bits: number, o: PowOptions): P
 }
 
 /**
- * Find a decimal string n so SHA-256(challenge + ":" + n) has >= bits leading zero bits. The main-thread loop is the
- * fallback when Workers or `blob:` workers (CSP) are unavailable; a worker that fails to start also falls back.
+ * Find a decimal string n so SHA-256(challenge ":" keyHashHex ":" n) has >= bits leading zero bits, where `keyHashHex` is
+ * hex(SHA-256(SPKI_DER)) of the key being registered (the work is bound to the key). `bits` above 26 is refused (the caller clamps),
+ * the solve gives up after `budgetMs` and stops at once when `signal` aborts. The main-thread loop is the fallback when Workers or
+ * `blob:` workers (CSP) are unavailable; a worker that fails to start also falls back.
  */
-export async function solvePow(challenge: string, bits: number, o: PowOptions = {}): Promise<string> {
+export async function solvePow(challenge: string, keyHashHex: string, bits: number, o: PowOptions = {}): Promise<string> {
   if (!(bits > 0)) return '0';
-  if (bits > 40) throw new RangeError('pow_bits too large');
+  if (bits > POW_SDK_MAX_BITS) throw new RangeError(`pow bits above ${POW_SDK_MAX_BITS} are refused`);
   if (o.signal?.aborted) throw abortError();
-  const prefix = challenge + ':';
+  const deadline = Date.now() + (o.budgetMs ?? 60_000);
+  const prefix = `${challenge}:${keyHashHex}:`;
   if (o.useWorker !== false) {
     let worker: WorkerLike | undefined;
     try {
@@ -177,11 +188,11 @@ export async function solvePow(challenge: string, bits: number, o: PowOptions = 
     }
     if (worker) {
       try {
-        return await solveInWorker(worker, prefix, bits, o);
+        return await solveInWorker(worker, prefix, bits, o, deadline);
       } catch (e) {
         if (e instanceof Error && e.name === 'RestrictoError') throw e;
       }
     }
   }
-  return solveOnMainThread(prefix, bits, o);
+  return solveOnMainThread(prefix, bits, o, deadline);
 }

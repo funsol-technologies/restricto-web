@@ -1,5 +1,5 @@
 import { createRestricto } from '@funsol/restricto-web';
-import type { RestrictoClient, RestrictoConfig, RestrictoError, RestrictoState, RestrictoStatus } from '@funsol/restricto-web';
+import type { ConfigStatus, RestrictoClient, RestrictoConfig, RestrictoError, RestrictoState, RestrictoStatus, UpgradeInfo } from '@funsol/restricto-web';
 import { computed, inject, shallowRef, type App, type ComputedRef, type InjectionKey, type ShallowRef } from 'vue';
 
 interface Injected {
@@ -37,6 +37,8 @@ export interface UseRestricto {
   deviceId: ComputedRef<string | null>;
   trustLevel: ComputedRef<number | null>;
   error: ComputedRef<RestrictoError | null>;
+  config: ComputedRef<ConfigStatus>;
+  upgrade: ComputedRef<UpgradeInfo | null>;
   fetch: RestrictoClient['fetch'];
   ready: () => Promise<RestrictoState>;
   client: RestrictoClient;
@@ -51,6 +53,8 @@ export function useRestricto(): UseRestricto {
     deviceId: computed(() => state.value.deviceId),
     trustLevel: computed(() => state.value.trustLevel),
     error: computed(() => state.value.error),
+    config: computed(() => state.value.config),
+    upgrade: computed(() => state.value.upgrade),
     fetch: client.fetch,
     ready: () => client.ready(),
     client,

@@ -1,6 +1,6 @@
 {
   "name": "@funsol/restricto-web",
-  "version": "0.1.0",
+  "version": "1.0.0-rc.1",
   "description": "Browser SDK for Restricto-Sig v1: proof-of-work registration, non-extractable device key, signed requests, verified responses.",
   "license": "MIT",
   "type": "module",

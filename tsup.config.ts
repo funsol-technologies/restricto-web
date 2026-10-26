@@ -13,10 +13,9 @@ export default defineConfig([
     sourcemap: true,
   },
   {
-    // <script src> / UMD-style global `Restricto`; noble is bundled so the fallback also works without a bundler
+    // <script src> with data-restricto-global="Name" opt-in (nothing is attached otherwise); noble is bundled so the fallback also works without a bundler
     entry: { restricto: 'src/global.ts' },
     format: ['iife'],
-    globalName: 'Restricto',
     minify: true,
     target: 'es2020',
     clean: false,

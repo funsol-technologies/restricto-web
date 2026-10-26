@@ -1,4 +1,7 @@
-/** Server error codes (restricto/client_errors.py) the SDK reacts to. */
+/**
+ * Public server error codes (restricto/client_errors.py), exported for your own logging. The SDK itself reacts to the signed `action`
+ * field, not to these (the one exception is a replayed nonce, see README).
+ */
 export const ServerCode = {
   SignatureRequired: 458010,
   UnknownDevice: 458033,
@@ -16,7 +19,8 @@ export type RestrictoErrorCode =
   | 'unsupported_environment'
   | 'unsupported_body'
   | 'body_too_large'
-  | 'authorization_conflict'
+  | 'redirect'
+  | 'upgrade_required'
   | 'challenge_failed'
   | 'register_failed'
   | 'response_unverified'
@@ -28,6 +32,10 @@ export interface RestrictoErrorInit {
   status?: number;
   serverCode?: number;
   retryAfter?: number;
+  /** The server answered, but not with a signature we could verify: a proxy, a captive portal, or an attacker. */
+  unsigned?: boolean;
+  /** The signed `action` of the refusal, when it was verified. */
+  action?: string;
   cause?: unknown;
 }
 
@@ -39,6 +47,9 @@ export class RestrictoError extends Error {
   readonly serverCode?: number;
   /** Seconds, from `Retry-After`. */
   readonly retryAfter?: number;
+  /** true when the (unsigned or unverifiable) reply is being treated as a network error. */
+  readonly unsigned?: boolean;
+  readonly action?: string;
 
   constructor(code: RestrictoErrorCode, message: string, init: RestrictoErrorInit = {}) {
     super(message);
@@ -47,6 +58,8 @@ export class RestrictoError extends Error {
     this.status = init.status;
     this.serverCode = init.serverCode;
     this.retryAfter = init.retryAfter;
+    this.unsigned = init.unsigned;
+    this.action = init.action;
     if (init.cause !== undefined) (this as { cause?: unknown }).cause = init.cause;
   }
 }
@@ -54,6 +67,11 @@ export class RestrictoError extends Error {
 export function abortError(): RestrictoError {
   return new RestrictoError('aborted', 'The operation was aborted.');
 }
+
+export const parseRetryAfter = (v: string | null): number | undefined => {
+  const n = Number(v);
+  return v && /^[0-9]{1,7}$/.test(v.trim()) && n > 0 ? n : undefined;
+};
 
 /** Pull `error_code` out of a Restricto error body without ever throwing. */
 export async function readServerCode(res: Response): Promise<number | undefined> {

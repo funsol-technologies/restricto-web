@@ -3,12 +3,11 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { makeSearcher, solvePow, type WorkerLike } from '../src/pow';
 
-const vectors = JSON.parse(readFileSync('/Users/mac/Documents/funsol_projects/Restricto/docs/web_vectors.json', 'utf8')) as {
-  pow: Array<{ challenge: string; bits: number; solution: string; sha256_hex?: string; valid?: boolean }>;
-};
+const KEY = 'ab'.repeat(32); // stands for hex(SHA-256(SPKI)) of the key being registered
 
+/** leading zero bits of SHA-256(challenge ":" KEY ":" n) - the key-bound puzzle */
 function zeroBits(challenge: string, n: string): number {
-  const d = createHash('sha256').update(`${challenge}:${n}`).digest();
+  const d = createHash('sha256').update(`${challenge}:${KEY}:${n}`).digest();
   let bits = 0;
   for (const b of d) {
     if (b === 0) bits += 8;
@@ -20,43 +19,26 @@ function zeroBits(challenge: string, n: string): number {
   return bits;
 }
 
-describe('proof of work vectors', () => {
-  const good = vectors.pow[0]!;
-  const bad = vectors.pow[1]!;
-
-  it('vector solution really has the claimed hash and the bad one is rejected by an independent check', () => {
-    expect(createHash('sha256').update(`${good.challenge}:${good.solution}`).digest('hex')).toBe(good.sha256_hex);
-    expect(zeroBits(good.challenge, good.solution)).toBeGreaterThanOrEqual(good.bits);
-    expect(zeroBits(bad.challenge, bad.solution)).toBeLessThan(bad.bits);
-  });
-
-  it('our searcher accepts the vector solution and the first hit from 0 is the vector solution', () => {
-    const search = makeSearcher();
-    const prefix = new TextEncoder().encode(`${good.challenge}:`);
-    expect(search(prefix, good.bits, Number(good.solution), 1)).toBe(Number(good.solution));
-    expect(search(prefix, bad.bits, Number(bad.solution), 1)).toBe(-1);
-    expect(search(prefix, good.bits, 0, 100000)).toBe(Number(good.solution));
-  });
-
+describe('proof of work', () => {
   it('matches Node SHA-256 across prefix lengths that hit every padding case and digit widths', () => {
     const search = makeSearcher();
     for (let len = 1; len < 140; len += 3) {
       const challenge = 'c'.repeat(len);
-      const hit = search(new TextEncoder().encode(`${challenge}:`), 8, 0, 5000);
+      const hit = search(new TextEncoder().encode(`${challenge}:${KEY}:`), 8, 0, 5000);
       expect(hit).toBeGreaterThanOrEqual(0);
       expect(zeroBits(challenge, String(hit))).toBeGreaterThanOrEqual(8);
       // and nothing earlier qualified
       for (let n = 0; n < hit; n++) expect(zeroBits(challenge, String(n))).toBeLessThan(8);
     }
     // digit width rollover (9 -> 10, 99 -> 100, ...) with a high threshold so the search spans them
-    const big = search(new TextEncoder().encode('width:'), 14, 0, 200000);
+    const big = search(new TextEncoder().encode(`width:${KEY}:`), 14, 0, 200000);
     expect(zeroBits('width', String(big))).toBeGreaterThanOrEqual(14);
   });
 
   it('solvePow returns a valid solution at 16 bits on the main thread, with progress', async () => {
     const progress: number[] = [];
     const started = performance.now();
-    const sol = await solvePow('v1.bench.challenge.mac', 16, { useWorker: false, onProgress: (n) => progress.push(n) });
+    const sol = await solvePow('v1.bench.challenge.mac', KEY, 16, { useWorker: false, onProgress: (n) => progress.push(n) });
     const ms = performance.now() - started;
     expect(zeroBits('v1.bench.challenge.mac', sol)).toBeGreaterThanOrEqual(16);
     expect(ms).toBeLessThan(2000);
@@ -65,17 +47,61 @@ describe('proof of work vectors', () => {
 
   it('benchmarks 20 bits (for the README)', async () => {
     const started = performance.now();
-    const sol = await solvePow('v1.bench20.challenge.mac', 20, { useWorker: false });
+    const sol = await solvePow('v1.bench20.challenge.mac', KEY, 20, { useWorker: false });
     expect(zeroBits('v1.bench20.challenge.mac', sol)).toBeGreaterThanOrEqual(20);
     console.log(`pow 20 bits main thread: ${(performance.now() - started).toFixed(0)} ms`);
   });
 
   it('bits 0 is free; abort rejects', async () => {
-    expect(await solvePow('x', 0)).toBe('0');
+    expect(await solvePow('x', KEY, 0)).toBe('0');
     const ac = new AbortController();
-    const p = solvePow('abort-me', 40, { useWorker: false, signal: ac.signal });
+    const p = solvePow('abort-me', KEY, 26, { useWorker: false, signal: ac.signal });
     setTimeout(() => ac.abort(), 30);
     await expect(p).rejects.toMatchObject({ code: 'aborted' });
+    await expect(solvePow('already', KEY, 8, { signal: ac.signal })).rejects.toMatchObject({ code: 'aborted' });
+  });
+
+  it('A-2: refuses more than 26 bits, and gives up after the wall-clock budget (main thread and worker)', async () => {
+    await expect(solvePow('x', KEY, 27)).rejects.toThrow(RangeError);
+    await expect(solvePow('x', KEY, 40)).rejects.toThrow(RangeError);
+    const started = performance.now();
+    await expect(solvePow('budget', KEY, 26, { useWorker: false, budgetMs: 80 })).rejects.toMatchObject({ code: 'register_failed', message: expect.stringMatching(/budget/) });
+    expect(performance.now() - started).toBeLessThan(1500);
+    // a worker that never answers is terminated when the budget is spent
+    let terminated = false;
+    const silent = (): WorkerLike => ({ onmessage: null, onerror: null, postMessage: () => undefined, terminate: () => void (terminated = true) });
+    await expect(solvePow('budget2', KEY, 26, { createWorker: silent, budgetMs: 50 })).rejects.toMatchObject({ code: 'register_failed' });
+    expect(terminated).toBe(true);
+  });
+
+  it('abort terminates a running worker', async () => {
+    let terminated = false;
+    const silent = (): WorkerLike => ({ onmessage: null, onerror: null, postMessage: () => undefined, terminate: () => void (terminated = true) });
+    const ac = new AbortController();
+    const p = solvePow('w-abort', KEY, 26, { createWorker: silent, signal: ac.signal });
+    setTimeout(() => ac.abort(), 20);
+    await expect(p).rejects.toMatchObject({ code: 'aborted' });
+    expect(terminated).toBe(true);
+  });
+
+  it('the work is bound to the key: another key hash needs different work', async () => {
+    const a = await solvePow('same-challenge', 'a'.repeat(64), 10, { useWorker: false });
+    const b = await solvePow('same-challenge', 'b'.repeat(64), 10, { useWorker: false });
+    const bitsFor = (key: string, n: string) => {
+      const d = createHash('sha256').update(`same-challenge:${key}:${n}`).digest();
+      let bits = 0;
+      for (const x of d) {
+        if (x === 0) bits += 8;
+        else {
+          bits += Math.clz32(x) - 24;
+          break;
+        }
+      }
+      return bits;
+    };
+    expect(bitsFor('a'.repeat(64), a)).toBeGreaterThanOrEqual(10);
+    expect(bitsFor('b'.repeat(64), b)).toBeGreaterThanOrEqual(10);
+    expect(a === b && bitsFor('a'.repeat(64), b) >= 10 && bitsFor('b'.repeat(64), a) >= 10).toBe(false);
   });
 });
 
@@ -97,12 +123,12 @@ describe('worker path', () => {
 
   it('the inline worker source is self-contained and solves', async () => {
     const challenge = 'v1.worker.test.mac';
-    const sol = await solvePow(challenge, 14, { createWorker: fakeWorker });
+    const sol = await solvePow(challenge, KEY, 14, { createWorker: fakeWorker });
     expect(zeroBits(challenge, sol)).toBeGreaterThanOrEqual(14);
   });
 
   it('falls back to the main thread when the worker cannot start (CSP)', async () => {
-    const sol = await solvePow('v1.csp.mac', 10, {
+    const sol = await solvePow('v1.csp.mac', KEY, 10, {
       createWorker: () => {
         throw new Error('blocked by CSP');
       },
@@ -111,7 +137,7 @@ describe('worker path', () => {
   });
 
   it('falls back when the worker errors asynchronously', async () => {
-    const sol = await solvePow('v1.err.mac', 10, {
+    const sol = await solvePow('v1.err.mac', KEY, 10, {
       createWorker: () => {
         const w: WorkerLike = {
           onmessage: null,

@@ -27,6 +27,8 @@ function Status() {
   const r = useRestricto();
   return (
     <div>
+      <span data-testid="config">{r.config.source}</span>
+      <span data-testid="upgrade">{r.upgrade ? `${r.upgrade.mode}:${r.upgrade.reason}` : '-'}</span>
       <span data-testid="status">{r.status}</span>
       <span data-testid="device">{r.deviceId ?? '-'}</span>
       <span data-testid="trust">{String(r.trustLevel)}</span>
@@ -130,5 +132,31 @@ describe('<RestrictoProvider>', () => {
     } finally {
       console.error = spy;
     }
+  });
+});
+
+describe('config + upgrade in the React hook', () => {
+  it('exposes the signed config status and a hard upgrade requirement', async () => {
+    const { server, config } = setup();
+    server.publishConfig({ extra: { min_sdk: { web: '9.0.0' } } });
+    const seen: string[] = [];
+    function Go() {
+      const r = useRestricto();
+      return <button onClick={() => void r.fetch(`${BASE}/api/x/`).catch(() => undefined)}>go</button>;
+    }
+    render(
+      <RestrictoProvider config={{ ...config, pinnedResponseKeys: undefined, pinnedConfigKeys: server.pinnedConfigKeys, onUpgradeRequired: (u) => seen.push(u.mode) }}>
+        <Status />
+        <Go />
+      </RestrictoProvider>,
+    );
+    expect(screen.getByTestId('config').textContent).toBe('defaults');
+    expect(screen.getByTestId('upgrade').textContent).toBe('-');
+    await act(async () => {
+      screen.getByText('go').click();
+    });
+    await waitFor(() => expect(screen.getByTestId('upgrade').textContent).toBe('hard:min_sdk'));
+    expect(screen.getByTestId('config').textContent).toBe('valid');
+    expect(seen).toContain('hard');
   });
 });
