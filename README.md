@@ -1,17 +1,19 @@
 # @funsol/restricto-web
 
-Browser SDK for **Restricto-Sig v1**. It gives a web page its own device identity (a non-extractable WebCrypto key),
-registers it with your Restricto deployment (challenge, proof of work, optional Turnstile), then signs every request to
-your API and verifies the signed responses.
+Browser SDK for **Restricto-Sig v1** (wire protocol: `docs/PROTOCOL_V1_FINAL.md` in the Restricto repository). It gives a web
+page its own device identity (a non-extractable WebCrypto key), registers it with your Restricto deployment (challenge, key-bound
+proof of work, optional Turnstile), signs every request to your API with a `Restricto-Signature` header and verifies the signed
+responses. Server-driven behaviour (response keys, PoW limits, renewal timing, retry budgets, forced upgrades) comes from a
+**signed config document** that you pin once.
 
-It talks only to *your* Restricto deployment, the Django package (`restricto`) or the Laravel package
-(`funsol/restricto-laravel`). Both speak the same wire protocol, so nothing in the SDK changes between them. It never talks
-to the Funsol control plane.
+It talks only to *your* Restricto deployment, the Django package (`restricto`) or the Laravel package (`funsol/restricto-laravel`).
+Both speak the same wire protocol. It never talks to the Funsol control plane.
 
-* ESM + CJS + types, zero runtime dependencies in the core (about 9.5 KB min+gzip). `@noble/curves` is a lazily-imported
-  Ed25519 fallback, loaded only in browsers without native WebCrypto Ed25519.
+* ESM + CJS + types, zero runtime dependencies in the core (about 12 KB min+gzip, see "Size"). The proof of work, the config
+  document parser and the `@noble/curves` Ed25519 fallback (browsers without native WebCrypto Ed25519) are lazily imported.
 * `/react` (React >= 18) and `/vue` (Vue >= 3.3) subpath exports; both frameworks are optional peers.
 * Works in Vite, Next.js and Nuxt (client side), and in a plain `<script>`.
+* Your own `Authorization` header is **not** touched (the signature lives in `Restricto-Signature`).
 
 ```
 npm i @funsol/restricto-web
@@ -27,27 +29,34 @@ import { createRestricto } from '@funsol/restricto-web';
 const restricto = createRestricto({
   baseUrl: 'https://api.example.com',   // origin of the Restricto deployment; only this origin is ever signed
   appId: 'web.example.com',             // X-APP-ID: the Application's package name in the Restricto admin
-  pinnedResponseKeys: { k1: 'PUBLIC_KEY_FROM_GO_LIVE_PAGE' }, // recommended, see "Response verification"
+  // RECOMMENDED: pin the config signing key(s) (printed by `restricto_config sign` / the Go-live page)
+  pinnedConfigKeys: { 'cfg-24f6ed6a': 'BASE64URL_ED25519_CONFIG_PUBLIC_KEY' },
+  onUpgradeRequired: (info) => showUpdateBanner(info), // optional, see "Config document"
 });
 
-const res = await restricto.fetch('https://api.example.com/api/things/', { method: 'POST', body: JSON.stringify({ a: 1 }) });
+const res = await restricto.fetch('https://api.example.com/api/things/', {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${appToken}` },   // yours, passed through untouched
+  body: JSON.stringify({ a: 1 }),
+});
 ```
 
-`restricto.fetch` is a drop-in for `window.fetch`. The first call registers the device (about 100 ms to a second of
-proof of work); concurrent calls and other tabs share that one registration.
+`restricto.fetch` is a drop-in for `window.fetch`. The first call fetches the config document and registers the device (the
+proof of work takes about 100 ms to a second at the default 16 bits); concurrent calls and other tabs share that one registration.
 
 **React**
 
 ```tsx
 import { RestrictoProvider, useRestricto } from '@funsol/restricto-web/react';
 
-<RestrictoProvider config={{ baseUrl, appId, pinnedResponseKeys }} autoRegister>
+<RestrictoProvider config={{ baseUrl, appId, pinnedConfigKeys }} autoRegister>
   <App />
 </RestrictoProvider>;
 
 function Things() {
-  const { fetch, status, deviceId, trustLevel, error, ready } = useRestricto(); // status: idle | registering | ready | error
-  // fetch(...) signs; `await ready()` waits for registration
+  const { fetch, status, deviceId, trustLevel, error, config, upgrade, ready } = useRestricto();
+  // status: idle | registering | ready | error;  config.source: none | defaults | valid | expired;
+  // upgrade: null | { mode: 'soft' | 'hard', reason, url }  (hard: signed calls now fail with `upgrade_required`)
 }
 ```
 
@@ -56,20 +65,23 @@ function Things() {
 ```ts
 import { createRestrictoPlugin, useRestricto } from '@funsol/restricto-web/vue';
 
-app.use(createRestrictoPlugin({ baseUrl, appId, pinnedResponseKeys }));
-// in a component: const { fetch, status, deviceId, trustLevel, error, ready } = useRestricto(); // status etc. are refs
+app.use(createRestrictoPlugin({ baseUrl, appId, pinnedConfigKeys }));
+// in a component: const { fetch, status, deviceId, trustLevel, error, config, upgrade, ready } = useRestricto(); // refs
 // options API / templates: this.$restricto.fetch(...)
 ```
 
-Next.js: put the provider in a `'use client'` component. Nuxt: register the plugin in a `*.client.ts` plugin. Nothing runs
-during SSR (no `window`/`indexedDB` access, effects never run, the first render is `idle`).
+Next.js: put the provider in a `'use client'` component. Nuxt: register the plugin in a `*.client.ts` plugin. Nothing runs during
+SSR (no `window`/`indexedDB` access, effects never run, the first render is `idle`).
 
-**Script tag** (global build, no bundler; the Ed25519 fallback is bundled in, 25 KB gzip):
+**Script tag** (no bundler; everything including the Ed25519 fallback is bundled, about 31 KB gzip). Nothing is attached to
+`window` unless the tag opts in, and you choose the name (a global signing factory is a convenience for injected scripts):
 
 ```html
-<script src="/restricto.global.js"></script>
-<script>const r = Restricto.createRestricto({ baseUrl: '...', appId: '...' });</script>
+<script src="/restricto.global.js" data-restricto-global="MyAppRestricto"></script>
+<script>const r = MyAppRestricto.createRestricto({ baseUrl: '...', appId: '...', pinnedConfigKeys: { /* ... */ } });</script>
 ```
+
+Prefer the npm package and a bundler where you can.
 
 ## Configuration
 
@@ -77,96 +89,119 @@ during SSR (no `window`/`indexedDB` access, effects never run, the first render 
 |---|---|---|
 | `baseUrl` | required | Origin of the deployment. Requests to any other origin pass through **untouched** (no signature, no `X-APP-ID`). |
 | `appId` | required | Sent as `X-APP-ID`. Also namespaces the stored key (`appId` + origin). |
-| `pinnedResponseKeys` | none | `{ kid: base64url Ed25519 public key }`. Strongly recommended. |
-| `verifyResponses` | `'strict'` | `'strict'` throws on a missing/bad response signature, `'warn'` calls `onWarning`, `'off'` skips. |
+| `pinnedConfigKeys` | none | **Recommended.** `{ kid: base64url raw Ed25519 public key }`, any may verify. Enables the signed config document and takes the response keys from it. |
+| `pinnedResponseKeys` | none | `{ kid: base64url Ed25519 public key }`: authoritative in addition to the config's keys (or on their own, without config). |
+| `verifyResponses` | `'strict'` | `'strict'` rejects missing/bad response signatures, `'warn'` calls `onWarning`, `'off'` skips. A valid signed config can relax `strict` to `warn` (kill switch). |
 | `getTurnstileToken` | none | `() => Promise<string>`; needed if the server has `TURNSTILE_SECRET`. |
 | `restrictoPath` | `/restricto` | Where the routes are mounted. |
 | `autoRegister` | `false` | Register at creation (browser only). Otherwise lazily on first signed call / `ready()`. |
-| `refreshMarginSeconds` | 6 h | Renew this long before `attested_until` (capped to a quarter of the validity); also schedules a timer (`autoRefresh: false` to disable). |
-| `keyStore` | IndexedDB, memory fallback | Implement `{ get, put, delete }` to store elsewhere; `createMemoryKeyStore()` for tests. |
+| `refreshMarginSeconds` | config `renew.before_s` (1 day) | Renew this long before `attested_until` (capped to a quarter of the validity); `autoRefresh: false` disables the timer. |
+| `registerCooldownMs` | config `renew.backoff` ladder (5 s, 30 s, 5 min, 1 h) | After a failed registration calls fail fast instead of redoing the proof of work. A registration that is "successful" but already expired waits at least 60 s. |
+| `configTimeoutMs` | 8000 | Timeout of the config document fetch (the first call then proceeds with what it has). |
+| `powBudgetMs` | 60000 | Wall-clock budget for the proof of work. |
+| `pow` / `onPowProgress` | worker on | `pow: { useWorker: false }` forces the main thread. |
+| `redirect` | `'manual'` | `'manual'` or `'error'`; signed calls never follow redirects. |
+| `transientBackoffMs` | 400 | Base delay of the bounded retry of unsigned answers to idempotent calls. |
+| `signedRenewal` | `true` | Try a signed `renew:true` before re-registering the key directly. |
+| `keyStore` | IndexedDB, memory fallback | Implement `{ get, put, delete }` (+ optional `getConfig`, `putConfig` for the anti-rollback state). |
 | `fetch` | global `fetch` | Underlying transport (tests, custom stacks). |
 | `appVersion` | `web-1.0.0` | Sent at registration. |
 | `maxBodyBytes` | 5 MiB | Matches the server limit; larger bodies are refused before sending. |
-| `pow` / `onPowProgress` | worker on | `pow: { useWorker: false }` forces the main thread. `onPowProgress(attempts)` for a progress UI. |
 | `onRequest(headers, info)` | none | Hook run before each signed attempt (extension point, see below). |
-| `registerCooldownMs` | 5000 | After a failed registration, calls fail fast instead of redoing the proof of work. |
+| `onUpgradeRequired(info)` / `onWarning(msg)` | `console.warn` | Events. |
 
-Other APIs: `restricto.sign({ method, url, body })` for custom HTTP stacks (returns `headers` plus `verify(response)`;
-`restricto.recover(response, signed)` tells you whether a rejection was fixed and the request should be re-signed and sent
-once); `restricto.ready()`, `getState()`, `subscribe()`, `isVerified(response)`, `reset()`, `close()`.
+Other APIs: `sign({ method, url, body })` for custom HTTP stacks (returns `headers` and `verify(response)`);
+`recover(response, signed)` (true = a signed rejection was handled, re-sign and resend ONCE; it only acts on a verified reply for
+that very request); `ready()`, `refreshConfig()`, `getState()` (`status`, `deviceId`, `trustLevel`, `attestedUntil`, `error`,
+`config`, `upgrade`), `subscribe()`, `isVerified(response)`, `reset()`, `close()` (both abort an in-flight registration).
 
-**axios** (no dependency on axios; an adapter, because interceptors run before the body is serialised and the signature
-must cover the exact bytes sent):
+**axios** (an adapter, because interceptors run before the body is serialised and the signature must cover the exact bytes sent):
 
 ```js
 import { restrictoAxios } from '@funsol/restricto-web';
 const http = axios.create({ baseURL: 'https://api.example.com', adapter: restrictoAxios(restricto) });
 ```
 
-## What the SDK does for you
+## Protocol summary (what the SDK sends and believes)
 
-* **Key**: ECDSA P-256 generated with `extractable: false`, stored as a `CryptoKey` in IndexedDB. The private key is never
-  readable by script, never in `localStorage`. Per-app namespace.
-* **Registration**: `POST /restricto/device/challenge/`, then proof of work (`SHA-256(challenge + ":" + n)` with `pow_bits`
-  leading zero bits, solved in an inline Web Worker created from a Blob, falling back to a time-sliced main-thread loop if
-  workers or `blob:` are blocked), then `POST /restricto/device/register/` with `platform: "web"`. Across tabs a Web Lock
-  makes sure only one registers; the others adopt the stored result.
-* **Renewal**: the same key re-registers with a fresh challenge before `attested_until`, and on demand.
-* **Signing**: `Authorization: Restricto-Sig v1 id=…,ts=…,nonce=…,sig=…` + `X-APP-ID`, canonical string exactly as in
-  DEVICE_ATTESTATION.md §5. The path is percent-normalised the way the server does it; the query goes out byte-for-byte as
-  sent. Bodies: string, `URLSearchParams`, `Blob`, `ArrayBuffer`/views, `Request` objects. `FormData` and streams are refused
-  with a clear error (sign uploads via presigned URLs). The browser clock is not trusted: the offset to the server is
-  tracked from `server_time` and `X-Restricto-Server-Time`.
-* **Recoverable rejections** are retried exactly once, re-signed with a new nonce and timestamp:
+* **Request**: `Restricto-Signature: v=1,id=<device>,ts=<s>,nonce=<22 chars>,bh=<b64url sha256 of the body>,sig=<ECDSA P-256 raw r||s>` and
+  `X-APP-ID`. The signed canonical string includes the lower-cased host (`:port` only when not the default), the canonical path
+  (percent-decoded to bytes, re-encoded except `A-Za-z0-9-._~` and `/`) and the canonical query (pairs decoded, re-encoded, sorted;
+  the raw query string is not signed, so re-ordering proxies are harmless). Bodies: string, `URLSearchParams`, `Blob`,
+  `ArrayBuffer`/views, `Request` objects. `FormData` and streams are refused (sign uploads via presigned URLs).
+* **Response**: `Restricto-Response-Signature` (one or more fields). The reply is accepted when ANY listed signature with a known `kid`
+  and `alg` (Ed25519) verifies; unknown algorithms and kids are ignored. The signature covers status, the request's nonce and device,
+  `ts` (within +-300 s of the server-corrected clock), the SHA-256 of the body (empty for HEAD/204/304) and the `Content-Type`,
+  `Location` and `Retry-After` values. A reply that was redirected or came from another origin is never trusted.
+* **Registration**: `POST /restricto/device/challenge/` (announces `pow`, `sig_versions`, `cfg_seq`), then proof of work **bound to the
+  key** (`SHA-256(challenge ":" hex(SHA-256(SPKI)) ":" n)` with the announced number of leading zero bits, never more than 26 and
+  never more than the signed config's `max_bits`, gives up after `powBudgetMs`, aborts on `close()`/`reset()`), then
+  `POST /restricto/device/register/` with `caps: { sig: [1], cfg: <seq held> }` and `renew`.
+* **Renewal**: a *signed* register request with `renew: true` using the existing key. A server that does not offer web renewals
+  answers with a signed refusal; the SDK then re-registers the same key directly and remembers that (the Python reference
+  currently does this for web: renewal is defined for Android/iOS there).
+* **Unsigned answers are never acted upon.** If a signed request gets an unsigned (or unverifiable) reply - a proxy, a captive
+  portal, an attacker - the SDK treats it as a network error: idempotent calls are retried a bounded number of times with backoff,
+  then `RestrictoError('response_unverified', { unsigned: true })` is thrown. It never wipes the key, never re-registers, never
+  adopts a clock from it. Only a *verified* body's `action` matters:
 
-  | Code | Action |
+  | `action` | SDK behaviour |
   |---|---|
-  | 458052 clock skew | resync from `X-Restricto-Server-Time`, retry |
-  | 458066 replay | retry with a new nonce |
-  | 458033 unknown device / 458085 attestation expired | re-register the same key, retry |
-  | 458071 revoked (403) | wipe the key, register a new one (fails if the device is banned), retry |
+  | `resync_clock` | adopt the **signed** `server_time` (works even if our clock is >300 s off), re-sign, retry once |
+  | `reregister` | renew the same key (`renew:true`, else plain re-registration), retry (budget `retry.unknown_device`) |
+  | `wipe` | discard the key, create and register a new one, retry; a second tab that also got `wipe` reuses the first tab's new key |
+  | `backoff` | a short `Retry-After` is waited out once for idempotent calls; otherwise the response goes to your code |
+  | `upgrade` | **advisory**: `state.upgrade = { mode: 'soft' }` + `onUpgradeRequired`; calls keep working |
+  | `none` / unknown | returned to your code. Unknown actions/codes are mapped by HTTP class and `Retry-After`; the one code the SDK looks at is a replayed nonce (458066), retried with a new nonce (budget `retry.replay`) |
 
-  Everything else (458047, 458010, rate limits, application errors) is returned as an ordinary response. These codes are
-  produced by the server before your handler runs, so resending a POST after them cannot execute it twice.
-* **Response verification**: Ed25519 over `RESTRICTO-RESP-V1 / status / request nonce / device id / ts / body hash`; the
-  timestamp must be within ±5 minutes. WebCrypto Ed25519 where available, `@noble/curves` otherwise.
+## Config document (spec section 6)
 
-### Response verification: pins and trust on first use
+`pinnedConfigKeys` makes the SDK fetch `GET /restricto/config/` at first use and whenever a challenge/register reply reports a
+higher `cfg_seq` (or an unknown response `kid` shows up, or the document nears its expiry). The document
+`{ payload, kid, sig }` is produced offline (`restricto_config sign --key config.pem` / `restricto:config:sign`) and merely served.
+The SDK:
 
-With `pinnedResponseKeys` the SDK trusts only those keys (an unknown `kid` is a failure and nothing is fetched). Without
-them it fetches `GET /restricto/keys/` on first use and caches it in memory: that is trust-on-first-use, so an attacker
-who controls the very first response of a page load could substitute keys. Pin the public key shown on the Go-live page
-(or `restricto_gen_response_key`) in your build. When you rotate, ship both `kid`s.
+* verifies `sig` over `RESTRICTO-CFG-V1\n<appId>\n<payload bytes>` with a pinned key (any listed key may verify), requires
+  `app` to equal its `appId`, `seq` >= the stored one (**anti-rollback, persisted** next to the key, survives `reset()`), and
+  `exp` in the future; an expired document is not adopted while a good one is held, and with none it still supplies its
+  key set and limits but its `relax` flags are dead. It never falls back to "no security": without any document and without
+  `pinnedResponseKeys` the SDK fails closed (`response_unverified`);
+* clamps every value to bounds compiled into the SDK (PoW <= 26 bits, skew 30-300 s, renewal margin 5 min-14 days, retry budgets
+  0-3/0-3/0-5, backoff 1 s-1 day) and ignores unknown fields;
+* uses `resp_keys` (states `active`/`next`/`retired`, with `nbf`/`naf`) as the response key set, so response keys rotate
+  (`next` -> `active`) without an SDK release;
+* applies `relax.verify_responses=false` (strict becomes warn) only while the document is valid;
+* **hard upgrade** (`min_sdk.web` above this SDK, `upgrade.mode: "hard"`, or no common signature version) comes ONLY from the signed
+  document: `state.upgrade.mode === 'hard'`, `onUpgradeRequired` fires, and signed calls fail with `RestrictoError('upgrade_required')`.
+  Soft upgrades only notify. `min_sdk` compares `major.minor.patch` (a `-rc.1` suffix is ignored).
 
-The Django server only signs responses to requests it identified. Rejections that happen *before* that (skew, unknown device,
-bad signature) are unsigned. The SDK therefore returns an unsigned response with a Restricto `error_code` (458xxx) as is
-(check `restricto.isVerified(res)`), but in `strict` mode any other unsigned response to a signed request, such as an HTML
-403 from a proxy, throws `RestrictoError('response_unverified')`. Until the server has a response-signing key,
-use `verifyResponses: 'warn'`.
+Without `pinnedConfigKeys` the SDK works with compiled-in defaults and fetches the response keys from `GET /restricto/keys/` on
+first use (trust on first use, **weaker**: whoever controls the first response of a page load can substitute keys). Pin.
 
 ## Server setup: CORS
 
-When the page and the API are on different origins the API must allow and expose these (see `docs/WEB_AND_LARAVEL.md`):
+When the page and the API are on different origins the API must allow and expose these:
 
 ```
 Access-Control-Allow-Origin:   https://app.example.com
-Access-Control-Allow-Headers:  Authorization, X-APP-ID, Content-Type
-Access-Control-Expose-Headers: X-Restricto-Resp-Kid, X-Restricto-Resp-Ts, X-Restricto-Resp-Sig, X-Restricto-Server-Time, Retry-After
+Access-Control-Allow-Headers:  Restricto-Signature, X-APP-ID, Content-Type
+Access-Control-Expose-Headers: Restricto-Response-Signature, Retry-After
 ```
 
-The same origin must be on the Application's allowed-origins list (the `Origin` header is checked at registration).
-If the expose list is missing, the signature headers are invisible to the page and strict mode reports
-"response carries no Restricto signature (… must expose X-Restricto-Resp-* …)".
+(add your own `Authorization` to the allow list if your API uses it). The same origin must be on the Application's allowed-origins
+list (the `Origin` header is checked at registration). If the expose list is missing the signature header is invisible to the page
+and strict mode reports "response carries no Restricto signature (... must expose Restricto-Response-Signature ...)".
 
-* **Django**: `django-cors-headers` with `CORS_ALLOWED_ORIGINS`, `CORS_ALLOW_HEADERS = [*default_headers, "x-app-id"]`,
-  `CORS_EXPOSE_HEADERS = ["X-Restricto-Resp-Kid", "X-Restricto-Resp-Ts", "X-Restricto-Resp-Sig", "X-Restricto-Server-Time", "Retry-After"]`.
+* **Django**: `django-cors-headers` with `CORS_ALLOW_HEADERS = [*default_headers, "restricto-signature", "x-app-id"]`,
+  `CORS_EXPOSE_HEADERS = ["Restricto-Response-Signature", "Retry-After"]`. Behind a proxy/CDN set `RESTRICTO["PUBLIC_HOST"]` so the
+  host line the browser signs matches.
 * **Laravel**: `php artisan restricto:cors` prints the config.
-* CSP: `connect-src` for the API, and `worker-src blob:` if you set a CSP (otherwise the main-thread solver is used, which is slower but works).
+* CSP: `connect-src` for the API, and `worker-src blob:` if you set a CSP (otherwise the main-thread solver is used, slower but works).
 
 ## Cloudflare Turnstile
 
-The SDK never loads Cloudflare scripts. If the server has `TURNSTILE_SECRET`, pass a callback; this one uses
-the non-interactive/managed widget and removes it afterwards:
+The SDK never loads Cloudflare scripts. If the server has `TURNSTILE_SECRET`, pass a callback; this one uses the
+non-interactive/managed widget and removes it afterwards:
 
 ```js
 function turnstileToken(siteKey) {
@@ -188,51 +223,65 @@ function turnstileToken(siteKey) {
     document.head.appendChild(s);
   });
 }
-createRestricto({ /* … */, getTurnstileToken: () => turnstileToken('0x4AAAA…') });
+createRestricto({ /* ... */, getTurnstileToken: () => turnstileToken('0x4AAAA...') });
 ```
 
-The callback runs for every registration and renewal (about every 3 days), and runs *before* the challenge is requested
-because challenges expire in 2 minutes.
+The callback runs for every registration and renewal (about every 3 days), and runs *before* the challenge is requested because
+challenges expire in 2 minutes.
 
 ## Security notes: what the web can and cannot prove
 
-* A browser cannot be hardware-attested. Registration proves **cost** (proof of work), optionally **humanness** (Turnstile)
-  and a **nuisance-level origin** check. The server caps web keys at **trust level 1** with a base risk of 15; budget and
-  automation policies should treat web as your weakest client.
+* A browser cannot be hardware-attested. Registration proves **cost** (key-bound proof of work), optionally **humanness**
+  (Turnstile) and a **nuisance-level origin** check. The server caps web keys at **trust level 1**; budget and automation policies
+  should treat web as your weakest client. Web registration is only for web-only Applications.
+* **Pin `pinnedConfigKeys`.** It is the one pin that makes response keys, rotation and forced upgrades trustworthy without an SDK
+  release; without it a MITM on the first load can substitute the response keys.
 * The key is **non-extractable**: script, extensions with page access and XSS cannot copy it out. But code running in your page
-  *can still use* it to sign while the page is compromised (a signing oracle). Damage is bounded to that origin, that
-  browser and the server's per-device credits and anomaly limits; fix the XSS and `reset()`/revoke the device.
+  *can still use* it to sign (and verify) while the page is compromised - a signing oracle - for as long as the page is open. Damage
+  is bounded to that origin and browser and the server's per-device limits; fix the XSS and revoke the device. The `<script>` build
+  therefore attaches no global unless you opt in with `data-restricto-global`; prefer the bundled package.
 * Clearing site data deletes the key; the next load registers a new device (and pays the proof of work again).
-* Signing prevents replay and tampering in transit and ties requests to one key. It does not stop a user driving
-  your site's own JavaScript, or a script that registers many keys slowly (that is what the proof of work, Turnstile and
-  per-IP registration limits are for).
-* If response signatures are verified with an unpinned (TOFU) key set, a MITM on the first load can substitute it. Pin.
-* Verification buffers a clone of each response body, so very large downloads cost memory; serve those from a
-  different origin (not signed) or set `verifyResponses: 'off'` for deployments that do not need it.
-* Redirects: the signature covers the URL you requested. A server redirect to another path will fail verification;
-  call the final URL directly.
-* `Authorization` is used by Restricto-Sig. Sending your own `Authorization` header to the signed origin throws
-  `authorization_conflict`; use another header for app tokens.
-* **Extension point for step-up (WebAuthn)**: not built in. Use `onRequest(headers, { method, url })` to add an assertion header
-  to selected requests, and obtain the assertion with `navigator.credentials.get()` yourself. The server side is separate.
+* Signing prevents replay and tampering in transit and ties requests to one key. It does not stop a user driving your site's own
+  JavaScript, or a script that registers many keys slowly (proof of work, Turnstile and per-network registration limits do that).
+* **Path canonicalisation**: `%2F` and `/` are the same canonical path (`/a%2Fb` signs as `/a/b`), `+` in a path is a literal plus
+  (`%2B`). Do not rely on `%2F` vs `/` to select different resources on the server. Known interop issue of the Python reference on **WSGI**
+  (Django): it rebuilds the path from `PATH_INFO`, which Django has already turned into decoded text, so a valid-UTF-8 non-ASCII
+  path (`/caf%C3%A9/`) is hashed as latin-1 (`%E9`) and rejected with 458047 (ASGI deployments use the raw path and agree with the
+  vectors; ASCII paths are unaffected). `scripts/live-check.mjs` reports it.
+* **No streaming**: request bodies must be bytes you can hash (no `ReadableStream`, no `FormData`); responses are buffered
+  (cloned) for verification, so SSE / `text/event-stream` and very large downloads are not supported on signed calls - serve them
+  from another origin (not signed) or use `verifyResponses: 'off'` for a dedicated client.
+* **Redirects** are never followed on signed calls (`redirect: 'manual'`); a reply that was redirected or came from another origin
+  is not trusted, never acted upon, and in `strict` mode rejected (`RestrictoError('redirect')` for an opaque redirect).
+* **Extension point for step-up (WebAuthn)**: use `onRequest(headers, { method, url })` to add an assertion header to selected
+  requests. The server side is separate.
 
-## Talking to Django vs Laravel
+## Live check
 
-Same endpoints, headers, error codes and vectors (`docs/test_vectors.json`, `docs/web_vectors.json`); you only point
-`baseUrl` at the deployment. Differences are operational: Django configures CORS via `django-cors-headers`, Laravel via
-`restricto:cors`; both enforce production enrolment with the Funsol control plane (`restricto_install` /
-`restricto:install`), which the browser never sees.
+`scripts/live-check.mjs` (not part of `npm test`) exercises register -> signed GET/POST/HEAD -> verified responses against a real
+deployment:
+
+```
+npm run build
+node scripts/live-check.mjs https://api.example.com web.example.com https://app.example.com [--config-key kid=BASE64URL_PUB]
+```
+
+## Size
+
+`npm run size` (esbuild, minified, code-split): the always-loaded core is about 12 KB gzip; the proof of work (about 2.3 KB) and the
+config document parser (about 1.2 KB) are lazy chunks, and `@noble/curves` is a further lazy import. The React and Vue entries add
+about 0.6 KB each.
 
 ## Development
 
 ```
-npm test          # vitest: vectors, PoW, fake server integration, IndexedDB, React, Vue, SSR
+npm test          # vitest: protocol vectors, PoW, fake server integration, config document, IndexedDB, React, Vue, SSR
 npm run typecheck
 npm run build     # tsup: ESM + CJS + .d.ts for ".", "./react", "./vue", plus dist/restricto.global.js
 npm run size
 ```
 
-`tests/helpers/fake-server.ts` is an independent implementation of the server side (stateless challenge, PoW check, signature,
-nonce replay and skew checks, Ed25519 response signing) written from the protocol document.
-
-The `Restricto-Sig` protocol is specified in `docs/DEVICE_ATTESTATION.md` and `docs/WEB_AND_LARAVEL.md` of the Restricto repository.
+`tests/vectors.test.ts` runs every group of `docs/protocol_vectors.json` (canonical path/query/host, header parse, request
+signature incl. negatives, response signature, config document, PoW, binding). `tests/helpers/fake-server.ts` is an independent
+implementation of the server side (own header parser, byte-oriented canonicalisation, signed rejections, config signing, key
+rotation) written from the protocol document.
